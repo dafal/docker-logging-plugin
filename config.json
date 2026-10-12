@@ -47,6 +47,30 @@
 			"settable": ["value"]
 		},
 		{
+			"name": "SPLUNK_LOGGING_DRIVER_HTTP_TIMEOUT",
+			"description": "Set the timeout for a single HTTP request to Splunk HEC. A hanging connection returns an error and is buffered once this elapses. 0 disables the timeout.",
+			"value": "10s",
+			"settable": ["value"]
+		},
+		{
+			"name": "SPLUNK_LOGGING_DRIVER_RETRY_BACKOFF_INITIAL",
+			"description": "Set the initial delay before retrying after a failed post to Splunk HEC. Empty means SPLUNK_LOGGING_DRIVER_POST_MESSAGES_FREQUENCY. 0 disables the backoff.",
+			"value": "",
+			"settable": ["value"]
+		},
+		{
+			"name": "SPLUNK_LOGGING_DRIVER_RETRY_BACKOFF_MAX",
+			"description": "Set the maximum delay between retries when Splunk HEC is unreachable. The delay doubles on every consecutive failure up to this value.",
+			"value": "1m",
+			"settable": ["value"]
+		},
+		{
+			"name": "SPLUNK_LOGGING_DRIVER_SHUTDOWN_FLUSH_TIMEOUT",
+			"description": "Set the per-request time budget once a container stops: the in-flight request is cancelled after it, and every request sent while stopping must complete within it. Messages that cannot be sent are dropped.",
+			"value": "2s",
+			"settable": ["value"]
+		},
+		{
 			"name": "SPLUNK_LOGGING_DRIVER_TEMP_MESSAGES_HOLD_DURATION",
 			"description": "Used when logs that are chunked by docker with 16kb limit. Set how long the system can wait for the next message to come.",
 			"value": "5s",

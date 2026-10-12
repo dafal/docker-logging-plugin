@@ -24,7 +24,10 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func (message *splunkMessage) EventAsString() (string, error) {
@@ -45,15 +48,24 @@ type HTTPEventCollectorMock struct {
 	tcpAddr     *net.TCPAddr
 	tcpListener *net.TCPListener
 
-	token               string
-	simulateServerError bool
+	token string
+
+	// Toggled by tests while the server is running, so accessed atomically.
+	serverError int32
+	hang        int32
+	delay       int64 // nanoseconds added to every request
 
 	test *testing.T
+
+	// Serializes request handling: a cancelled request can still be handled
+	// while the driver already sends the next one on a new connection.
+	mu sync.Mutex
 
 	connectionVerified bool
 	gzipEnabled        *bool
 	messages           []*splunkMessage
-	numOfRequests      int
+	numOfRequests      int64
+	acceptedPosts      int64
 }
 
 func NewHTTPEventCollectorMock(t *testing.T) *HTTPEventCollectorMock {
@@ -63,12 +75,42 @@ func NewHTTPEventCollectorMock(t *testing.T) *HTTPEventCollectorMock {
 		t.Fatal(err)
 	}
 	return &HTTPEventCollectorMock{
-		tcpAddr:             tcpAddr,
-		tcpListener:         tcpListener,
-		token:               "4642492F-D8BD-47F1-A005-0C08AE4657DF",
-		simulateServerError: false,
-		test:                t,
-		connectionVerified:  false}
+		tcpAddr:            tcpAddr,
+		tcpListener:        tcpListener,
+		token:              "4642492F-D8BD-47F1-A005-0C08AE4657DF",
+		test:               t,
+		connectionVerified: false}
+}
+
+func setFlag(flag *int32, value bool) {
+	if value {
+		atomic.StoreInt32(flag, 1)
+	} else {
+		atomic.StoreInt32(flag, 0)
+	}
+}
+
+// setServerError makes every request fail with HTTP 500.
+func (hec *HTTPEventCollectorMock) setServerError(value bool) {
+	setFlag(&hec.serverError, value)
+}
+
+// setHang makes every request hang until the client gives up.
+func (hec *HTTPEventCollectorMock) setHang(value bool) {
+	setFlag(&hec.hang, value)
+}
+
+// setDelay makes every request take at least the given duration.
+func (hec *HTTPEventCollectorMock) setDelay(delay time.Duration) {
+	atomic.StoreInt64(&hec.delay, int64(delay))
+}
+
+func (hec *HTTPEventCollectorMock) requestCount() int64 {
+	return atomic.LoadInt64(&hec.numOfRequests)
+}
+
+func (hec *HTTPEventCollectorMock) acceptedPostCount() int64 {
+	return atomic.LoadInt64(&hec.acceptedPosts)
 }
 
 func (hec *HTTPEventCollectorMock) URL() string {
@@ -86,15 +128,36 @@ func (hec *HTTPEventCollectorMock) Close() error {
 func (hec *HTTPEventCollectorMock) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	var err error
 
-	hec.numOfRequests++
+	atomic.AddInt64(&hec.numOfRequests, 1)
 
-	if hec.simulateServerError {
+	if delay := atomic.LoadInt64(&hec.delay); delay > 0 {
+		time.Sleep(time.Duration(delay))
+	}
+
+	if atomic.LoadInt32(&hec.hang) == 1 {
+		if request.Body != nil {
+			defer request.Body.Close()
+		}
+		// Accept the connection and never reply, until the client gives up.
+		// The guard only stops a leaked handler; it is far longer than any
+		// test deadline, so it cannot make a timeout test pass by itself.
+		select {
+		case <-request.Context().Done():
+		case <-time.After(5 * time.Minute):
+		}
+		return
+	}
+
+	if atomic.LoadInt32(&hec.serverError) == 1 {
 		if request.Body != nil {
 			defer request.Body.Close()
 		}
 		writer.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+
+	hec.mu.Lock()
+	defer hec.mu.Unlock()
 
 	switch request.Method {
 	case http.MethodGet:
@@ -165,6 +228,7 @@ func (hec *HTTPEventCollectorMock) ServeHTTP(writer http.ResponseWriter, request
 			gzipReader.Close()
 		}
 
+		atomic.AddInt64(&hec.acceptedPosts, 1)
 		writer.WriteHeader(http.StatusOK)
 	default:
 		hec.test.Errorf("Unexpected HTTP method %s", http.MethodOptions)

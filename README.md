@@ -164,6 +164,10 @@ SPLUNK_LOGGING_DRIVER_BUFFER_MAX | The maximum amount of messages to hold in buf
 SPLUNK_LOGGING_DRIVER_CHANNEL_SIZE | How many pending messages can be in the channel used to send messages to background logger worker, which batches them. | 4 * 1000
 SPLUNK_LOGGING_DRIVER_TEMP_MESSAGES_HOLD_DURATION | Appends logs that are chunked by docker with 16kb limit. It specifies how long the system can wait for the next message to come. | 100ms 
 SPLUNK_LOGGING_DRIVER_TEMP_MESSAGES_BUFFER_SIZE	| Appends logs that are chunked by docker with 16kb limit. It specifies the biggest message in bytes that the system can reassemble. The value provided here should be smaller than or equal to the Splunk HEC limit. 1 MB is the default HEC setting. | 1048576 (1mb)
+SPLUNK_LOGGING_DRIVER_HTTP_TIMEOUT | Timeout for a single HTTP request to Splunk HEC. If HEC accepts the connection but does not respond, the request fails after this duration and the messages are buffered and retried instead of blocking the driver. Set to 0 to disable the timeout. | 10s
+SPLUNK_LOGGING_DRIVER_RETRY_BACKOFF_INITIAL | Delay before the first retry after a failed post to Splunk HEC. Doubles on every consecutive failure. When empty, the value of SPLUNK_LOGGING_DRIVER_POST_MESSAGES_FREQUENCY is used. Set to 0 to disable the backoff. | value of SPLUNK_LOGGING_DRIVER_POST_MESSAGES_FREQUENCY
+SPLUNK_LOGGING_DRIVER_RETRY_BACKOFF_MAX | Maximum delay between retries when Splunk HEC is unreachable. Acts as the retry cap during a prolonged outage. Must not be lower than SPLUNK_LOGGING_DRIVER_RETRY_BACKOFF_INITIAL. | 1m
+SPLUNK_LOGGING_DRIVER_SHUTDOWN_FLUSH_TIMEOUT | Per-request time budget once a container stops. The request already in flight is cancelled when this budget is spent, and every request sent while stopping (including the final flush) must complete within it. If a final request fails, the remaining messages are dropped without retry. Increase it if a single batch to your HEC can take longer than this. | 2s
 SPLUNK_LOGGING_DRIVER_JSON_LOGS	| Determines if JSON logging is enabled. https://docs.docker.com/config/containers/logging/json-file/ | true
 SPLUNK_TELEMETRY	| Determines if telemetry is enabled. | true
 
@@ -248,6 +252,18 @@ Test HEC endpoint is accessible
 $ curl -k https://<ip_address>:8088/services/collector/health
 {"text":"HEC is healthy","code":200}
 ```
+
+When HEC is unreachable the driver buffers messages and retries with an exponential backoff (see SPLUNK_LOGGING_DRIVER_HTTP_TIMEOUT, SPLUNK_LOGGING_DRIVER_RETRY_BACKOFF_INITIAL and SPLUNK_LOGGING_DRIVER_RETRY_BACKOFF_MAX). The following daemon log lines describe the connection state:
+```
+Failed to send messages to Splunk HEC, will retry later      # a post failed, backoff started/increased
+Splunk HEC buffer is full while backing off, dropping oldest  # buffer is capped, oldest messages are dropped (logged at most every 10s)
+Connection to Splunk HEC restored, buffer flushed             # HEC is reachable again, buffered messages were sent
+Final flush to Splunk HEC failed while closing the driver     # container stopped while HEC was unreachable, remaining messages dropped
+```
+A hanging HEC endpoint (connection accepted but no response) no longer blocks the driver indefinitely: requests fail after SPLUNK_LOGGING_DRIVER_HTTP_TIMEOUT and are handled like any other connection failure. Because messages are sent synchronously, container log writes can still be delayed by up to that timeout while a request is pending and the channel is full.
+
+Out-of-range advanced options (for example a negative or zero buffer size, a negative timeout, or a maximum backoff lower than the initial backoff) are rejected when a container starts, with an error naming the variable. Values that cannot be parsed are logged and replaced by their default.
+
 ## Check your HEC configuration for clusters
 
 If you are using an Indexer Cluster, the current plugin accepts a single splunk-url value. We recommend that you configure a load balancer in front of your Indexer tier. Make sure the load balancer can successfully tunnel the HEC requests to the indexer tier. If HEC is configured in an Indexer Cluster environment, all indexers should have same HEC token configured. See http://docs.splunk.com/Documentation/Splunk/7.0.3/Data/UsetheHTTPEventCollector.  

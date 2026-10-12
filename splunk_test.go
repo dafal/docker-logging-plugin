@@ -27,6 +27,14 @@ import (
 	"github.com/docker/docker/daemon/logger"
 )
 
+// Telemetry posts an extra event to the mock HEC 5s after a logger starts,
+// which breaks message counts in tests that run longer than that (for example
+// under the race detector). Tests that need it can enable it explicitly.
+func TestMain(m *testing.M) {
+	os.Setenv(envVarSplunkTelemetry, "false")
+	os.Exit(m.Run())
+}
+
 // Validate options
 func TestValidateLogOpt(t *testing.T) {
 	err := ValidateLogOpt(map[string]string{
@@ -42,10 +50,10 @@ func TestValidateLogOpt(t *testing.T) {
 		splunkVerifyConnectionKey:     "true",
 		splunkGzipCompressionKey:      "true",
 		splunkGzipCompressionLevelKey: "1",
-		envKey:                        "a",
-		envRegexKey:                   "^foo",
-		labelsKey:                     "b",
-		tagKey:                        "c",
+		envKey:      "a",
+		envRegexKey: "^foo",
+		labelsKey:   "b",
+		tagKey:      "c",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -253,6 +261,9 @@ func TestDefault(t *testing.T) {
 		splunkLoggerDriver.hec.postMessagesFrequency != defaultPostMessagesFrequency ||
 		splunkLoggerDriver.hec.postMessagesBatchSize != defaultPostMessagesBatchSize ||
 		splunkLoggerDriver.hec.bufferMaximum != defaultBufferMaximum ||
+		splunkLoggerDriver.hec.retryBackoffInitial != defaultPostMessagesFrequency ||
+		splunkLoggerDriver.hec.retryBackoffMax != defaultRetryBackoffMax ||
+		splunkLoggerDriver.hec.client.Timeout != defaultHTTPTimeout ||
 		cap(splunkLoggerDriver.stream) != defaultStreamChannelSize {
 		t.Fatal("Found not default values setup in Splunk Logging Driver.")
 	}
@@ -341,9 +352,9 @@ func TestInlineFormatWithNonDefaultOptions(t *testing.T) {
 			splunkIndexKey:           "myindex",
 			splunkFormatKey:          splunkFormatInline,
 			splunkGzipCompressionKey: "true",
-			tagKey:                   "{{.ImageName}}/{{.Name}}",
-			labelsKey:                "a",
-			envRegexKey:              "^foo",
+			tagKey:      "{{.ImageName}}/{{.Name}}",
+			labelsKey:   "a",
+			envRegexKey: "^foo",
 		},
 		ContainerID:        "containeriid",
 		ContainerName:      "/container_name",
@@ -385,6 +396,9 @@ func TestInlineFormatWithNonDefaultOptions(t *testing.T) {
 		splunkLoggerDriver.hec.postMessagesFrequency != defaultPostMessagesFrequency ||
 		splunkLoggerDriver.hec.postMessagesBatchSize != defaultPostMessagesBatchSize ||
 		splunkLoggerDriver.hec.bufferMaximum != defaultBufferMaximum ||
+		splunkLoggerDriver.hec.retryBackoffInitial != defaultPostMessagesFrequency ||
+		splunkLoggerDriver.hec.retryBackoffMax != defaultRetryBackoffMax ||
+		splunkLoggerDriver.hec.client.Timeout != defaultHTTPTimeout ||
 		cap(splunkLoggerDriver.stream) != defaultStreamChannelSize {
 		t.Fatal("Values do not match configuration.")
 	}
@@ -485,6 +499,9 @@ func TestJsonFormat(t *testing.T) {
 		splunkLoggerDriver.hec.postMessagesFrequency != defaultPostMessagesFrequency ||
 		splunkLoggerDriver.hec.postMessagesBatchSize != defaultPostMessagesBatchSize ||
 		splunkLoggerDriver.hec.bufferMaximum != defaultBufferMaximum ||
+		splunkLoggerDriver.hec.retryBackoffInitial != defaultPostMessagesFrequency ||
+		splunkLoggerDriver.hec.retryBackoffMax != defaultRetryBackoffMax ||
+		splunkLoggerDriver.hec.client.Timeout != defaultHTTPTimeout ||
 		cap(splunkLoggerDriver.stream) != defaultStreamChannelSize {
 		t.Fatal("Values do not match configuration.")
 	}
@@ -601,6 +618,9 @@ func TestRawFormat(t *testing.T) {
 		splunkLoggerDriver.hec.postMessagesFrequency != defaultPostMessagesFrequency ||
 		splunkLoggerDriver.hec.postMessagesBatchSize != defaultPostMessagesBatchSize ||
 		splunkLoggerDriver.hec.bufferMaximum != defaultBufferMaximum ||
+		splunkLoggerDriver.hec.retryBackoffInitial != defaultPostMessagesFrequency ||
+		splunkLoggerDriver.hec.retryBackoffMax != defaultRetryBackoffMax ||
+		splunkLoggerDriver.hec.client.Timeout != defaultHTTPTimeout ||
 		cap(splunkLoggerDriver.stream) != defaultStreamChannelSize ||
 		string(splunkLoggerDriver.prefix) != "containeriid " {
 		t.Fatal("Values do not match configuration.")
@@ -715,6 +735,9 @@ func TestRawFormatWithLabels(t *testing.T) {
 		splunkLoggerDriver.hec.postMessagesFrequency != defaultPostMessagesFrequency ||
 		splunkLoggerDriver.hec.postMessagesBatchSize != defaultPostMessagesBatchSize ||
 		splunkLoggerDriver.hec.bufferMaximum != defaultBufferMaximum ||
+		splunkLoggerDriver.hec.retryBackoffInitial != defaultPostMessagesFrequency ||
+		splunkLoggerDriver.hec.retryBackoffMax != defaultRetryBackoffMax ||
+		splunkLoggerDriver.hec.client.Timeout != defaultHTTPTimeout ||
 		cap(splunkLoggerDriver.stream) != defaultStreamChannelSize ||
 		string(splunkLoggerDriver.prefix) != "containeriid a=b " {
 		t.Fatal("Values do not match configuration.")
@@ -827,6 +850,9 @@ func TestRawFormatWithoutTag(t *testing.T) {
 		splunkLoggerDriver.hec.postMessagesFrequency != defaultPostMessagesFrequency ||
 		splunkLoggerDriver.hec.postMessagesBatchSize != defaultPostMessagesBatchSize ||
 		splunkLoggerDriver.hec.bufferMaximum != defaultBufferMaximum ||
+		splunkLoggerDriver.hec.retryBackoffInitial != defaultPostMessagesFrequency ||
+		splunkLoggerDriver.hec.retryBackoffMax != defaultRetryBackoffMax ||
+		splunkLoggerDriver.hec.client.Timeout != defaultHTTPTimeout ||
 		cap(splunkLoggerDriver.stream) != defaultStreamChannelSize ||
 		string(splunkLoggerDriver.prefix) != "" {
 		t.Log(string(splunkLoggerDriver.prefix) + "a")
@@ -944,8 +970,8 @@ func TestBatching(t *testing.T) {
 	}
 
 	// 16 batches
-	if hec.numOfRequests != 16 {
-		t.Fatalf("Unexpected number of requests %d", hec.numOfRequests)
+	if hec.requestCount() != 16 {
+		t.Fatalf("Unexpected number of requests %d", hec.requestCount())
 	}
 
 	err = hec.Close()
@@ -1012,8 +1038,8 @@ func TestFrequency(t *testing.T) {
 
 	// 1 to verify connection and 10 to verify that we have sent messages with required frequency,
 	// but because frequency is too small (to keep test quick), instead of 11, use 9 if context switches will be slow
-	if hec.numOfRequests < 9 {
-		t.Fatalf("Unexpected number of requests %d", hec.numOfRequests)
+	if hec.requestCount() < 9 {
+		t.Fatalf("Unexpected number of requests %d", hec.requestCount())
 	}
 
 	err = hec.Close()
@@ -1091,8 +1117,8 @@ func TestOneMessagePerRequest(t *testing.T) {
 	}
 
 	// 10 messages
-	if hec.numOfRequests != 10 {
-		t.Fatalf("Unexpected number of requests %d", hec.numOfRequests)
+	if hec.requestCount() != 10 {
+		t.Fatalf("Unexpected number of requests %d", hec.requestCount())
 	}
 
 	err = hec.Close()
@@ -1120,7 +1146,7 @@ func TestOneMessagePerRequest(t *testing.T) {
 // Driver should not be created when HEC is unresponsive
 func TestVerify(t *testing.T) {
 	hec := NewHTTPEventCollectorMock(t)
-	hec.simulateServerError = true
+	hec.setServerError(true)
 	go hec.Serve()
 
 	info := logger.Info{
@@ -1146,11 +1172,36 @@ func TestVerify(t *testing.T) {
 	}
 }
 
+// disableRetryBackoff makes the driver retry immediately after every failure,
+// matching the legacy behavior where the retry cadence was not backed off.
+func disableRetryBackoff(t *testing.T) {
+	t.Helper()
+	if err := os.Setenv(envVarRetryBackoffInitial, "0s"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv(envVarRetryBackoffMax, "0s"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func restoreRetryBackoff(t *testing.T) {
+	t.Helper()
+	if err := os.Setenv(envVarRetryBackoffInitial, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv(envVarRetryBackoffMax, ""); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // Verify that user can specify to skip verification that Splunk HEC is working.
 // Also in this test we verify retry logic.
 func TestSkipVerify(t *testing.T) {
+	disableRetryBackoff(t)
+	defer restoreRetryBackoff(t)
+
 	hec := NewHTTPEventCollectorMock(t)
-	hec.simulateServerError = true
+	hec.setServerError(true)
 	go hec.Serve()
 
 	info := logger.Info{
@@ -1184,7 +1235,7 @@ func TestSkipVerify(t *testing.T) {
 		t.Fatal("No messages should be accepted at this point")
 	}
 
-	hec.simulateServerError = false
+	hec.setServerError(false)
 
 	for i := defaultStreamChannelSize * 2; i < defaultStreamChannelSize*4; i++ {
 		if err := loggerDriver.Log(&logger.Message{Line: []byte(fmt.Sprintf("%d", i)), Source: "stdout", Timestamp: time.Now()}); err != nil {
@@ -1219,6 +1270,9 @@ func TestSkipVerify(t *testing.T) {
 
 // Verify logic for when we filled whole buffer
 func TestBufferMaximum(t *testing.T) {
+	disableRetryBackoff(t)
+	defer restoreRetryBackoff(t)
+
 	if err := os.Setenv(envVarPostMessagesBatchSize, "2"); err != nil {
 		t.Fatal(err)
 	}
@@ -1232,7 +1286,7 @@ func TestBufferMaximum(t *testing.T) {
 	}
 
 	hec := NewHTTPEventCollectorMock(t)
-	hec.simulateServerError = true
+	hec.setServerError(true)
 	go hec.Serve()
 
 	info := logger.Info{
@@ -1266,7 +1320,7 @@ func TestBufferMaximum(t *testing.T) {
 		t.Fatal("No messages should be accepted at this point")
 	}
 
-	hec.simulateServerError = false
+	hec.setServerError(false)
 
 	err = loggerDriver.Close()
 	if err != nil {
@@ -1308,6 +1362,9 @@ func TestBufferMaximum(t *testing.T) {
 
 // Verify that we are not blocking close when HEC is down for the whole time
 func TestServerAlwaysDown(t *testing.T) {
+	disableRetryBackoff(t)
+	defer restoreRetryBackoff(t)
+
 	if err := os.Setenv(envVarPostMessagesBatchSize, "2"); err != nil {
 		t.Fatal(err)
 	}
@@ -1321,7 +1378,7 @@ func TestServerAlwaysDown(t *testing.T) {
 	}
 
 	hec := NewHTTPEventCollectorMock(t)
-	hec.simulateServerError = true
+	hec.setServerError(true)
 	go hec.Serve()
 
 	info := logger.Info{
@@ -1432,7 +1489,487 @@ func TestCannotSendAfterClose(t *testing.T) {
 }
 
 func TestSetTelemetry(t *testing.T) {
-	if err := os.Setenv(envVarSplunkTelemetry, ""); err != nil {
+	// Restore the suite default set in TestMain.
+	if err := os.Setenv(envVarSplunkTelemetry, "false"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Verify that the retry backoff doubles up to the configured maximum.
+func TestBackoffProgression(t *testing.T) {
+	hec := &hecClient{
+		retryBackoffInitial: 1 * time.Second,
+		retryBackoffMax:     8 * time.Second,
+	}
+
+	if !hec.canAttempt() {
+		t.Fatal("The first attempt should be allowed")
+	}
+
+	expectedDelays := []time.Duration{1, 2, 4, 8, 8}
+	for i, expected := range expectedDelays {
+		hec.recordFailure()
+		if hec.retryBackoff != expected*time.Second {
+			t.Fatalf("Failure %d: expected backoff %v, got %v", i, expected*time.Second, hec.retryBackoff)
+		}
+		if hec.canAttempt() {
+			t.Fatalf("Failure %d: driver should be backing off", i)
+		}
+	}
+
+	if hec.consecutiveFailures != len(expectedDelays) {
+		t.Fatalf("Expected %d consecutive failures, got %d", len(expectedDelays), hec.consecutiveFailures)
+	}
+	if hec.failedAttempts != uint64(len(expectedDelays)) {
+		t.Fatalf("Expected %d failed attempts, got %d", len(expectedDelays), hec.failedAttempts)
+	}
+}
+
+// Verify that a successful post resets the backoff state.
+func TestBackoffResetOnSuccess(t *testing.T) {
+	hec := &hecClient{
+		retryBackoffInitial: 1 * time.Second,
+		retryBackoffMax:     8 * time.Second,
+	}
+
+	hec.recordFailure()
+	if hec.canAttempt() {
+		t.Fatal("Driver should be backing off after a failure")
+	}
+
+	hec.recordSuccess(5)
+	if hec.consecutiveFailures != 0 || hec.retryBackoff != 0 || !hec.nextAttemptAt.IsZero() {
+		t.Fatal("Backoff state should be reset after a success")
+	}
+	if !hec.canAttempt() {
+		t.Fatal("Attempts should be allowed after a success")
+	}
+	if hec.failedAttempts != 1 {
+		t.Fatalf("Expected 1 cumulative failed attempt, got %d", hec.failedAttempts)
+	}
+}
+
+// Verify that the buffer is capped while the driver is backing off.
+func TestEnforceBufferMaximum(t *testing.T) {
+	hec := &hecClient{bufferMaximum: 3}
+	messages := make([]*splunkMessage, 5)
+	for i := range messages {
+		messages[i] = &splunkMessage{Host: fmt.Sprintf("%d", i)}
+	}
+
+	remaining := hec.enforceBufferMaximum(messages)
+	if len(remaining) != 3 {
+		t.Fatalf("Expected buffer of 3, got %d", len(remaining))
+	}
+	if remaining[0].Host != "2" || remaining[2].Host != "4" {
+		t.Fatal("Expected the oldest messages to be dropped")
+	}
+	if hec.droppedMessages != 2 {
+		t.Fatalf("Expected 2 dropped messages, got %d", hec.droppedMessages)
+	}
+
+	underLimit := []*splunkMessage{{Host: "a"}}
+	if got := hec.enforceBufferMaximum(underLimit); len(got) != 1 {
+		t.Fatalf("Expected buffer to be left untouched, got %d", len(got))
+	}
+}
+
+// withEnv sets environment variables for a test and returns a function that
+// restores their previous values.
+func withEnv(t *testing.T, vars map[string]string) func() {
+	t.Helper()
+	previous := make(map[string]string, len(vars))
+	for name, value := range vars {
+		previous[name] = os.Getenv(name)
+		if err := os.Setenv(name, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return func() {
+		for name, value := range previous {
+			if err := os.Setenv(name, value); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
+func testLoggerInfo(url, token string) logger.Info {
+	return logger.Info{
+		Config: map[string]string{
+			splunkURLKey:              url,
+			splunkTokenKey:            token,
+			splunkVerifyConnectionKey: "false",
+		},
+		ContainerID:        "containeriid",
+		ContainerName:      "/container_name",
+		ContainerImageID:   "contaimageid",
+		ContainerImageName: "container_image_name",
+	}
+}
+
+// waitFor polls condition until it is true or the timeout expires.
+func waitFor(timeout time.Duration, condition func() bool) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return condition()
+}
+
+// Verify that a single request to a hanging HEC endpoint fails after the
+// configured HTTP timeout. The mock never replies on its own, so without the
+// timeout this request would not return before the test deadline.
+func TestHTTPTimeoutBoundsRequest(t *testing.T) {
+	defer withEnv(t, map[string]string{
+		envVarHTTPTimeout:     "200ms",
+		envVarSplunkTelemetry: "false",
+	})()
+
+	hec := NewHTTPEventCollectorMock(t)
+	hec.setHang(true)
+	go hec.Serve()
+	defer hec.Close()
+
+	loggerDriver, err := New(testLoggerInfo(hec.URL(), hec.token))
+	if err != nil {
+		t.Fatal(err)
+	}
+	splunkLoggerDriver := loggerDriver.(*splunkLoggerInline)
+
+	result := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		result <- splunkLoggerDriver.hec.tryPostMessages([]*splunkMessage{{Event: "hang"}})
+	}()
+
+	select {
+	case err := <-result:
+		elapsed := time.Since(start)
+		if err == nil {
+			t.Fatal("Expected the request to a hanging endpoint to fail")
+		}
+		if elapsed < 150*time.Millisecond || elapsed > 2*time.Second {
+			t.Fatalf("Expected the request to fail after about 200ms, took %v", elapsed)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Request to a hanging endpoint was not bounded by the HTTP timeout")
+	}
+
+	if err := loggerDriver.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Verify that a hanging HEC endpoint cannot block the driver forever.
+func TestHTTPTimeoutDoesNotBlock(t *testing.T) {
+	defer withEnv(t, map[string]string{
+		envVarHTTPTimeout:           "200ms",
+		envVarPostMessagesFrequency: "50ms",
+		envVarStreamChannelSize:     "1",
+		envVarPostMessagesBatchSize: "1000",
+		envVarShutdownFlushTimeout:  "300ms",
+		envVarSplunkTelemetry:       "false",
+	})()
+
+	hec := NewHTTPEventCollectorMock(t)
+	hec.setHang(true)
+	go hec.Serve()
+
+	loggerDriver, err := New(testLoggerInfo(hec.URL(), hec.token))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		// More messages than the channel buffer, so Log would block forever if
+		// the worker got stuck on a hanging request.
+		for i := 0; i < 50; i++ {
+			if err := loggerDriver.Log(&logger.Message{Line: []byte(fmt.Sprintf("%d", i)), Source: "stdout", Timestamp: time.Now()}); err != nil {
+				t.Errorf("Unexpected error logging message %d: %v", i, err)
+				break
+			}
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Log blocked because the HTTP timeout is not effective")
+	}
+
+	// Close must also return even though HEC never responds: the in-flight
+	// request is cancelled and the final flush is bounded to 300ms.
+	closed := make(chan struct{})
+	start := time.Now()
+	go func() {
+		if err := loggerDriver.Close(); err != nil {
+			t.Errorf("Unexpected error closing driver: %v", err)
+		}
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Fatalf("Close took %v, expected it to be bounded by the shutdown flush timeout", elapsed)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close blocked because the HTTP timeout is not effective")
+	}
+
+	if err := hec.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Verify that closing the driver cancels an in-flight request instead of
+// waiting for the HTTP timeout, and bounds the final flush.
+func TestCloseCancelsInFlightRequest(t *testing.T) {
+	defer withEnv(t, map[string]string{
+		envVarHTTPTimeout:           "30s",
+		envVarShutdownFlushTimeout:  "300ms",
+		envVarPostMessagesBatchSize: "1",
+		envVarPostMessagesFrequency: "1h",
+		envVarSplunkTelemetry:       "false",
+	})()
+
+	hec := NewHTTPEventCollectorMock(t)
+	hec.setHang(true)
+	go hec.Serve()
+	defer hec.Close()
+
+	loggerDriver, err := New(testLoggerInfo(hec.URL(), hec.token))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := loggerDriver.Log(&logger.Message{Line: []byte("in flight"), Source: "stdout", Timestamp: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if !waitFor(2*time.Second, func() bool { return hec.requestCount() >= 1 }) {
+		t.Fatal("Expected a request to be in flight")
+	}
+
+	start := time.Now()
+	if err := loggerDriver.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("Close took %v, expected the in-flight request to be cancelled", elapsed)
+	}
+}
+
+// Verify that stopping a container with a backlog does not drop messages when
+// HEC is healthy but slow: the drain may take longer than the shutdown budget
+// as long as each request fits in it.
+func TestCloseDrainsSlowHealthyHEC(t *testing.T) {
+	defer withEnv(t, map[string]string{
+		envVarShutdownFlushTimeout:  "300ms",
+		envVarPostMessagesBatchSize: "10",
+		envVarPostMessagesFrequency: "1h",
+		envVarBufferMaximum:         "20",
+		envVarStreamChannelSize:     "200",
+		envVarSplunkTelemetry:       "false",
+	})()
+
+	hec := NewHTTPEventCollectorMock(t)
+	hec.setDelay(100 * time.Millisecond)
+	go hec.Serve()
+	defer hec.Close()
+
+	loggerDriver, err := New(testLoggerInfo(hec.URL(), hec.token))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 10 batches of 100ms each: about 1s of draining, well over the 300ms
+	// budget, while every single request fits in it.
+	for i := 0; i < 100; i++ {
+		if err := loggerDriver.Log(&logger.Message{Line: []byte(fmt.Sprintf("%d", i)), Source: "stdout", Timestamp: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := loggerDriver.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(hec.messages) != 100 {
+		t.Fatalf("Expected all 100 messages to be delivered on close, got %d", len(hec.messages))
+	}
+}
+
+// Verify that the worker retries when the backoff expires, without waiting for
+// the regular flush, and that it recovers once HEC is reachable again.
+func TestRetryAfterBackoffExpires(t *testing.T) {
+	defer withEnv(t, map[string]string{
+		envVarRetryBackoffInitial:   "100ms",
+		envVarRetryBackoffMax:       "100ms",
+		envVarPostMessagesBatchSize: "1",
+		envVarPostMessagesFrequency: "1h",
+		envVarSplunkTelemetry:       "false",
+	})()
+
+	hec := NewHTTPEventCollectorMock(t)
+	hec.setServerError(true)
+	go hec.Serve()
+	defer hec.Close()
+
+	loggerDriver, err := New(testLoggerInfo(hec.URL(), hec.token))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := loggerDriver.Log(&logger.Message{Line: []byte("retry me"), Source: "stdout", Timestamp: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The regular flush is 1h away, so every request after the first one
+	// comes from the retry timer, spaced by the 100ms backoff.
+	time.Sleep(650 * time.Millisecond)
+	if count := hec.requestCount(); count < 3 || count > 10 {
+		t.Fatalf("Expected retries spaced by the backoff, got %d requests in 650ms", count)
+	}
+
+	hec.setServerError(false)
+	if !waitFor(2*time.Second, func() bool { return hec.acceptedPostCount() >= 1 }) {
+		t.Fatal("Expected the buffered message to be delivered once HEC recovered")
+	}
+
+	if err := loggerDriver.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(hec.messages) != 1 {
+		t.Fatalf("Expected exactly 1 delivered message, got %d", len(hec.messages))
+	}
+}
+
+// Verify that the buffer never exceeds its maximum while backing off, even
+// between batch boundaries, and that the oldest messages are the ones dropped.
+func TestBufferMaximumStrictDuringBackoff(t *testing.T) {
+	defer withEnv(t, map[string]string{
+		envVarRetryBackoffInitial:   "1h",
+		envVarRetryBackoffMax:       "1h",
+		envVarPostMessagesBatchSize: "1",
+		envVarPostMessagesFrequency: "1h",
+		envVarBufferMaximum:         "10",
+		envVarStreamChannelSize:     "0",
+		envVarSplunkTelemetry:       "false",
+	})()
+
+	hec := NewHTTPEventCollectorMock(t)
+	hec.setServerError(true)
+	go hec.Serve()
+	defer hec.Close()
+
+	loggerDriver, err := New(testLoggerInfo(hec.URL(), hec.token))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The first message fails and starts a 1h backoff; the rest only go
+	// through the buffer limit.
+	for i := 0; i < 100; i++ {
+		if err := loggerDriver.Log(&logger.Message{Line: []byte(fmt.Sprintf("%d", i)), Source: "stdout", Timestamp: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	hec.setServerError(false)
+	if err := loggerDriver.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(hec.messages) != 10 {
+		t.Fatalf("Expected the final flush to deliver the 10 newest messages, got %d", len(hec.messages))
+	}
+	for i, message := range hec.messages {
+		event, err := message.EventAsMap()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if event["line"] != fmt.Sprintf("%d", 90+i) {
+			t.Fatalf("Unexpected event in message %v", event)
+		}
+	}
+}
+
+// Verify that per-message drops during a backoff are counted but reported in
+// a single rate-limited warning.
+func TestEnforceBufferMaximumRateLimitsWarnings(t *testing.T) {
+	hec := &hecClient{bufferMaximum: 1}
+	messages := []*splunkMessage{{Host: "0"}}
+	for i := 1; i <= 5; i++ {
+		messages = append(messages, &splunkMessage{Host: fmt.Sprintf("%d", i)})
+		messages = hec.enforceBufferMaximum(messages)
+	}
+
+	if hec.droppedMessages != 5 {
+		t.Fatalf("Expected 5 dropped messages, got %d", hec.droppedMessages)
+	}
+	// The first drop is reported immediately, the next 4 wait for the interval.
+	if hec.dropsSinceWarn != 4 {
+		t.Fatalf("Expected 4 drops pending the next warning, got %d", hec.dropsSinceWarn)
+	}
+
+	hec.recordSuccess(1)
+	if hec.dropsSinceWarn != 0 || !hec.lastDropWarnAt.IsZero() {
+		t.Fatal("Expected the drop warning state to reset after a success")
+	}
+}
+
+// Verify that a long post frequency alone does not make the derived initial
+// backoff exceed the maximum and fail the driver.
+func TestDerivedBackoffIsCappedByMax(t *testing.T) {
+	defer withEnv(t, map[string]string{
+		envVarPostMessagesFrequency: "2m",
+		envVarSplunkTelemetry:       "false",
+	})()
+
+	loggerDriver, err := New(testLoggerInfo("http://127.0.0.1:1", "token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer loggerDriver.Close()
+
+	hec := loggerDriver.(*splunkLoggerInline).hec
+	if hec.retryBackoffInitial != defaultRetryBackoffMax {
+		t.Fatalf("Expected the derived initial backoff to be capped to %v, got %v", defaultRetryBackoffMax, hec.retryBackoffInitial)
+	}
+}
+
+// Verify that out-of-range advanced options are rejected when the driver starts.
+func TestInvalidAdvancedOptions(t *testing.T) {
+	cases := []struct {
+		vars     map[string]string
+		mentions string
+	}{
+		{map[string]string{envVarBufferMaximum: "-1"}, envVarBufferMaximum},
+		{map[string]string{envVarBufferMaximum: "0"}, envVarBufferMaximum},
+		{map[string]string{envVarPostMessagesBatchSize: "0"}, envVarPostMessagesBatchSize},
+		{map[string]string{envVarPostMessagesFrequency: "0s"}, envVarPostMessagesFrequency},
+		{map[string]string{envVarStreamChannelSize: "-1"}, envVarStreamChannelSize},
+		{map[string]string{envVarHTTPTimeout: "-1s"}, envVarHTTPTimeout},
+		{map[string]string{envVarRetryBackoffInitial: "-1s"}, envVarRetryBackoffInitial},
+		{map[string]string{envVarRetryBackoffMax: "-1s"}, envVarRetryBackoffMax},
+		{map[string]string{envVarRetryBackoffInitial: "10s", envVarRetryBackoffMax: "1s"}, envVarRetryBackoffInitial},
+		{map[string]string{envVarShutdownFlushTimeout: "0s"}, envVarShutdownFlushTimeout},
+	}
+
+	for _, c := range cases {
+		restore := withEnv(t, c.vars)
+		_, err := New(testLoggerInfo("http://127.0.0.1:1", "token"))
+		restore()
+		if err == nil {
+			t.Fatalf("Expected %v to be rejected", c.vars)
+		}
+		if !strings.Contains(err.Error(), c.mentions) {
+			t.Fatalf("Expected error for %v to mention %s, got: %v", c.vars, c.mentions, err)
+		}
 	}
 }

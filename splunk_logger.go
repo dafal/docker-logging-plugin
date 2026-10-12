@@ -19,11 +19,13 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -79,6 +81,14 @@ const (
 	defaultJSONLogs = true
 	// Determines if telemetry is enabled
 	defaultSplunkTelemetry = true
+	// Default timeout for a single HTTP request to Splunk HEC
+	defaultHTTPTimeout = 10 * time.Second
+	// Maximum delay between retries when Splunk HEC is unreachable
+	defaultRetryBackoffMax = 1 * time.Minute
+	// Time budget for the final flush when the driver is closed
+	defaultShutdownFlushTimeout = 2 * time.Second
+	// Minimum interval between "dropping oldest messages" warnings
+	dropWarnInterval = 10 * time.Second
 )
 
 const (
@@ -91,6 +101,10 @@ const (
 	envVarReadFifoErrorRetryNumber     = "SPLUNK_LOGGING_DRIVER_FIFO_ERROR_RETRY_TIME"
 	envVarJSONLogs                     = "SPLUNK_LOGGING_DRIVER_JSON_LOGS"
 	envVarSplunkTelemetry              = "SPLUNK_TELEMETRY"
+	envVarHTTPTimeout                  = "SPLUNK_LOGGING_DRIVER_HTTP_TIMEOUT"
+	envVarRetryBackoffInitial          = "SPLUNK_LOGGING_DRIVER_RETRY_BACKOFF_INITIAL"
+	envVarRetryBackoffMax              = "SPLUNK_LOGGING_DRIVER_RETRY_BACKOFF_MAX"
+	envVarShutdownFlushTimeout         = "SPLUNK_LOGGING_DRIVER_SHUTDOWN_FLUSH_TIMEOUT"
 )
 
 type splunkLoggerInterface interface {
@@ -221,11 +235,26 @@ func New(info logger.Info) (logger.Logger, error) {
 		}
 	}
 
+	// Timeout for a single request to Splunk HEC. Without it a hanging
+	// connection blocks the worker and eventually the Docker logging pipeline.
+	// A value of 0 disables the timeout.
+	httpTimeout := getAdvancedOptionDuration(envVarHTTPTimeout, defaultHTTPTimeout)
+
 	transport := &http.Transport{
 		TLSClientConfig: tlsConfig,
+		DialContext: (&net.Dialer{
+			Timeout:   httpTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   httpTimeout,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: httpTimeout,
 	}
 	client := &http.Client{
 		Transport: transport,
+		Timeout:   httpTimeout,
 	}
 
 	source := info.Config[splunkSourceKey]
@@ -263,6 +292,23 @@ func New(info logger.Info) (logger.Logger, error) {
 		streamChannelSize     = getAdvancedOptionInt(envVarStreamChannelSize, defaultStreamChannelSize)
 	)
 
+	// Back off between retries when HEC is unreachable. Defaults to the regular
+	// post frequency so the first retry keeps the previous cadence.
+	retryBackoffInitial := getAdvancedOptionDuration(envVarRetryBackoffInitial, postMessagesFrequency)
+	retryBackoffMax := getAdvancedOptionDuration(envVarRetryBackoffMax, defaultRetryBackoffMax)
+	// A derived initial backoff (post frequency) must not turn a valid
+	// configuration into an error: cap it to the maximum instead. Explicit
+	// values are still validated below.
+	if os.Getenv(envVarRetryBackoffInitial) == "" && retryBackoffMax > 0 && retryBackoffInitial > retryBackoffMax {
+		retryBackoffInitial = retryBackoffMax
+	}
+	shutdownFlushTimeout := getAdvancedOptionDuration(envVarShutdownFlushTimeout, defaultShutdownFlushTimeout)
+
+	if err := validateAdvancedOptions(postMessagesFrequency, postMessagesBatchSize, bufferMaximum, streamChannelSize,
+		httpTimeout, retryBackoffInitial, retryBackoffMax, shutdownFlushTimeout); err != nil {
+		return nil, err
+	}
+
 	logger := &splunkLogger{
 		hec: &hecClient{
 			client:                client,
@@ -275,6 +321,9 @@ func New(info logger.Info) (logger.Logger, error) {
 			postMessagesFrequency: postMessagesFrequency,
 			postMessagesBatchSize: postMessagesBatchSize,
 			bufferMaximum:         bufferMaximum,
+			retryBackoffInitial:   retryBackoffInitial,
+			retryBackoffMax:       retryBackoffMax,
+			shutdownFlushTimeout:  shutdownFlushTimeout,
 		},
 		nullMessage: nullMessage,
 		stream:      make(chan *splunkMessage, streamChannelSize),
@@ -344,6 +393,8 @@ func New(info logger.Info) (logger.Logger, error) {
 	default:
 		return nil, fmt.Errorf("unexpected format %s", splunkFormat)
 	}
+
+	logger.hec.ctx, logger.hec.cancel = context.WithCancel(context.Background())
 
 	if getAdvancedOptionBool(envVarSplunkTelemetry, defaultSplunkTelemetry) {
 		go telemetry(info, logger, sourceType, splunkFormat)
@@ -461,6 +512,35 @@ func getAdvancedOptionBool(envName string, defaultValue bool) bool {
 		return defaultValue
 	}
 	return bool(parsedValue)
+}
+
+// validateAdvancedOptions rejects values that would make the driver misbehave
+// (for example a negative buffer size or a disabled timeout by mistake), so a
+// bad setting is reported at container start instead of failing later.
+func validateAdvancedOptions(postMessagesFrequency time.Duration, postMessagesBatchSize, bufferMaximum, streamChannelSize int,
+	httpTimeout, retryBackoffInitial, retryBackoffMax, shutdownFlushTimeout time.Duration) error {
+	switch {
+	case postMessagesFrequency <= 0:
+		return fmt.Errorf("%s: %s must be greater than 0, got %v", driverName, envVarPostMessagesFrequency, postMessagesFrequency)
+	case postMessagesBatchSize <= 0:
+		return fmt.Errorf("%s: %s must be greater than 0, got %d", driverName, envVarPostMessagesBatchSize, postMessagesBatchSize)
+	case bufferMaximum <= 0:
+		return fmt.Errorf("%s: %s must be greater than 0, got %d", driverName, envVarBufferMaximum, bufferMaximum)
+	case streamChannelSize < 0:
+		return fmt.Errorf("%s: %s must not be negative, got %d", driverName, envVarStreamChannelSize, streamChannelSize)
+	case httpTimeout < 0:
+		return fmt.Errorf("%s: %s must not be negative, got %v", driverName, envVarHTTPTimeout, httpTimeout)
+	case retryBackoffInitial < 0:
+		return fmt.Errorf("%s: %s must not be negative, got %v", driverName, envVarRetryBackoffInitial, retryBackoffInitial)
+	case retryBackoffMax < 0:
+		return fmt.Errorf("%s: %s must not be negative, got %v", driverName, envVarRetryBackoffMax, retryBackoffMax)
+	case retryBackoffMax > 0 && retryBackoffInitial > retryBackoffMax:
+		return fmt.Errorf("%s: %s (%v) must not be greater than %s (%v)", driverName,
+			envVarRetryBackoffInitial, retryBackoffInitial, envVarRetryBackoffMax, retryBackoffMax)
+	case shutdownFlushTimeout <= 0:
+		return fmt.Errorf("%s: %s must be greater than 0, got %v", driverName, envVarShutdownFlushTimeout, shutdownFlushTimeout)
+	}
+	return nil
 }
 
 // Log() takes in a log message reference and put it into a queue: stream
@@ -593,11 +673,36 @@ Do a HEC POST when
 func (l *splunkLogger) worker() {
 	var messages []*splunkMessage
 	timer := time.NewTicker(l.hec.postMessagesFrequency)
+	defer timer.Stop()
+
+	// Fires when the backoff delay expires, so a retry does not have to wait
+	// for the next regular flush.
+	var retryTimer *time.Timer
+	var retryC <-chan time.Time
+	stopRetry := func() {
+		if retryTimer != nil {
+			retryTimer.Stop()
+			retryTimer = nil
+			retryC = nil
+		}
+	}
+	scheduleRetry := func() {
+		stopRetry()
+		if len(messages) == 0 {
+			return
+		}
+		if wait, pending := l.hec.retryWait(); pending {
+			retryTimer = time.NewTimer(wait)
+			retryC = retryTimer.C
+		}
+	}
+
 	for {
 		select {
 		case message, open := <-l.stream:
 			// if the stream channel is closed, post the remaining messages in the buffer
 			if !open {
+				stopRetry()
 				logrus.Debugf("stream is closed with %d events", len(messages))
 				l.hec.postMessages(messages, true)
 				l.lock.Lock()
@@ -608,20 +713,40 @@ func (l *splunkLogger) worker() {
 				return
 			}
 			messages = append(messages, message)
-			// Only sending when we get exactly to the batch size,
-			// This also helps not to fire postMessages on every new message,
-			// when previous try failed.
-			if len(messages)%l.hec.postMessagesBatchSize == 0 {
+			if !l.hec.canAttempt() {
+				// Backing off: keep the buffer within its maximum on every
+				// message, not only on batch boundaries.
+				messages = l.hec.enforceBufferMaximum(messages)
+			} else if len(messages)%l.hec.postMessagesBatchSize == 0 {
+				// Only sending when we get exactly to the batch size,
+				// This also helps not to fire postMessages on every new message,
+				// when previous try failed.
 				messages = l.hec.postMessages(messages, false)
+				scheduleRetry()
 			}
 		case <-timer.C:
 			logrus.Debugf("messages buffer timeout, sending %d events", len(messages))
 			messages = l.hec.postMessages(messages, false)
+			scheduleRetry()
+		case <-retryC:
+			retryTimer = nil
+			retryC = nil
+			logrus.Debugf("retry backoff expired, sending %d events", len(messages))
+			messages = l.hec.postMessages(messages, false)
+			scheduleRetry()
 		}
 	}
 }
 
 func (l *splunkLogger) Close() error {
+	// A hung request keeps the worker busy, which can keep Log callers (and so
+	// the lock below) blocked. New requests now get their own shutdown budget;
+	// the one already in flight gets the same budget to finish normally, then
+	// is cancelled rather than waiting for the HTTP timeout.
+	l.hec.startClosing()
+	cancelTimer := time.AfterFunc(l.hec.finalFlushTimeout(), l.hec.cancelRequests)
+	defer cancelTimer.Stop()
+	defer l.hec.cancelRequests()
 	l.lock.Lock()
 	defer l.lock.Unlock()
 	if l.closedCond == nil {
