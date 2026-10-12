@@ -47,6 +47,8 @@ $ docker plugin enable splunk-logging-plugin
 ```
 ### Install the plugin from the tar file 
 
+To cross-build for another architecture, run the tests, or install on a host without build tools, see [BUILDING.md](BUILDING.md).
+
 1. Clone the repository and check out release branch
 ```
 $ git clone  https://github.com/splunk/docker-logging-plugin.git
